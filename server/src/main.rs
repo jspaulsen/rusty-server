@@ -19,6 +19,8 @@ fn main() {
     // let 
     // either decompose the server into an incoming and outgoing queue while it runs
     // and/or have the server run in a separate thread
+    // ALSO: It could decompose into an object, one with a flag for stopping the server
+    // the input/output queues and the handle so we can join on it.
     // TODO: Maybe run spawns the thread and returns a handle
     thread::spawn(move || {
         server.run();
