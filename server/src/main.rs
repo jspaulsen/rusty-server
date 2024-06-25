@@ -12,21 +12,22 @@ const TICKS_PER_SECOND: u32 = 30;
 // spawn thread
 // run runtime
 fn main() {
-    let server = WebsocketServer::new();
-    let mut outgoing = server.outgoing_queue();
-    let mut incoming = server.incoming_queue();
-
-    // let 
-    // either decompose the server into an incoming and outgoing queue while it runs
-    // and/or have the server run in a separate thread
-    // ALSO: It could decompose into an object, one with a flag for stopping the server
-    // the input/output queues and the handle so we can join on it.
-    // TODO: Maybe run spawns the thread and returns a handle
-    thread::spawn(move || {
-        server.run();
-    });
+    println!("Starting server");
+    let mut server = WebsocketServer::new("localhost", 3000)
+        .run();
 
     loop {
+        let message = server.recv_next();
+
+        if let Some(message) = message {
+            println!("Received message in main: {:?}", message);
+
+            server.send(message);
+        }
+
+
+
+
         thread::sleep(Duration::from_millis(1));
         // println!("tick")
         // perform some work; if the time between now and the last tick is less than the duration per second, sleep for the difference
