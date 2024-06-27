@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use tokio::{
     net::TcpListener,
     runtime::Builder,
@@ -12,6 +13,7 @@ use tokio::{
         RwLock,
     },
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::server::{
     connection::Connection,
@@ -25,18 +27,19 @@ type ThreadHandle = std::thread::JoinHandle<Result<(), BoxedError>>;
 type ConnectionMap = std::collections::HashMap<uuid::Uuid, UnboundedSender<Message>>;
 type SharedConnectionMap = Arc<RwLock<ConnectionMap>>;
 
+
 struct InternalServer {
     bound: String,
-    send: UnboundedSender<Message>,
-    recv: Option<UnboundedReceiver<Message>>,
+    to_process: UnboundedSender<Message>, // from_server -> to_process
+    from_process: Option<UnboundedReceiver<Message>>, // from_process -> to_server
 
-    // TODO: Flag
-    // TODO: Track and manage connections; these can be stored in a HashMap<u64, TcpStream>
-    // with an incrementing id for each connection
+    internal_to_process: UnboundedSender<Message>,
+    internal_from_server: Option<UnboundedReceiver<Message>>,
+
+    token: CancellationToken,
 
     // TODO: maybe we want to route messages to each connection instead of just having a send loop which
     // sends to all connections
-    position: u64,
     connections: SharedConnectionMap,
 }
 
@@ -45,18 +48,35 @@ struct InternalServer {
 pub struct WebsocketServer {
     bound: String,
 
-    flag: bool, // TODO: this deffo changes
-
+    token: CancellationToken,
     handle: Option<ThreadHandle>,
-    recv: Option<UnboundedReceiver<Message>>,
 
+    recv: Option<UnboundedReceiver<Message>>,
     send: Option<UnboundedSender<Message>>,
-    // sender: UnboundedSender<Message>,
 }
 
 
 
 impl InternalServer {
+    fn new(bound: String, token: CancellationToken, send: UnboundedSender<Message>, recv: UnboundedReceiver<Message>) -> Self {
+        let (internal_send, internal_recv) = unbounded_channel::<Message>();
+        let connections = Arc::new(
+            RwLock::new(
+                ConnectionMap::new()
+            )
+        );
+
+        Self {
+            bound,
+            token,
+            to_process: send,
+            from_process: Some(recv),
+            connections,
+            internal_to_process: internal_send,
+            internal_from_server: Some(internal_recv),
+        }
+    }
+    
     fn run_server_thread(&mut self) -> Result<(), BoxedError> {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -70,28 +90,56 @@ impl InternalServer {
         runtime.block_on(self.server_loop())
     }
 
-    /// Processes messages received from the server; this will push messages to the relevant connection.
-    /// by looking up the connection id in the connection map
-    async fn process_messages(mut recv: UnboundedReceiver<Message>, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
+    /// Processes messages coming from the websocket connections and sends them to the process
+    async fn process_incoming_messages(mut recv: UnboundedReceiver<Message>, send: UnboundedSender<Message>, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
         while let Some(msg) = recv.recv().await {
-            println!("Received message in process_messages: {:?}", msg);
+            println!("Received incoming message in process_incoming_messages: {:?}", msg);
+            
+            // Remove the connection from the map if it's a disconnection message
+            if let Message::Disconnection(uid) = msg {
+                mapping
+                    .write()
+                    .await
+                    .remove(&uid);
+            }
+
+            send
+                .send(msg)
+                .expect("Failed to send message - process_incoming_messages. This will only happen if the server has panicked");
+        }
+
+        Ok(())
+    }
+
+    /// Processes messages received from the process; this will push messages to the relevant connection.
+    /// by looking up the connection id in the connection map
+    async fn process_outgoing_messages(mut recv: UnboundedReceiver<Message>, mapping: SharedConnectionMap) {
+        while let Some(msg) = recv.recv().await {
+            println!("Received outgoing message in process_outgoing_messages: {:?}", msg);
             
             let rw = mapping
                 .read()
                 .await;
 
-            let connection = rw.get(&msg.connection_id());
+            let connection_id = &msg.connection_id();
+            let connection = rw.get(connection_id);
 
-            // TODO: We shouldn't panic here, just remove the connection from the map
-            // as the connection has been closed
             if let Some(connection) = connection {
-                connection
-                    .send(msg)
-                    .expect("Failed to send message - process_messages");
+                let result = connection
+                    .send(msg);
+                
+                // If the connection is dead, remove it from the map
+                if let Err(_) = result {
+                    drop(rw); // Release the lock so we can write to the map
+
+                    let mut write = mapping
+                        .write()
+                        .await;
+    
+                    write.remove(connection_id);
+                }
             }
         }
-
-        Ok(())
     }
 
     async fn process_connections(listener: TcpListener, to_process: UnboundedSender<Message>, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
@@ -101,19 +149,20 @@ impl InternalServer {
             let uid = uuid::Uuid::new_v4();
 
             let (send, recv) = unbounded_channel::<Message>();
-            let connection = Connection::new(uid, ws_stream, recv, to_process.clone());
+            let connection = Connection::new(
+                uid, 
+                ws_stream, 
+                recv, 
+                to_process.clone(),
+            );
             
             // Create a new connection and insert it into the connection map
             mapping
                 .write()
                 .await
                 .insert(uid, send);
-            
-            tokio::spawn(async move {
-                connection.run().await
-            });
-            
-            // TODO: tokio::spawn
+
+            tokio::spawn(async move { connection.run().await });
         }
     }
 
@@ -121,23 +170,35 @@ impl InternalServer {
     async fn server_loop(&mut self) -> Result<(), BoxedError> {
         let listener = TcpListener::bind(&self.bound)
             .await
-            .expect("Failed to bind to port 3000");
+            .expect(format!("Failed to bind to {}", self.bound).as_str());
 
-        // PANIC: This should never happen
-        // TODO: This should select! against a "stop" flag
-        tokio::try_join! {
-            Self::process_messages(
-                self.recv
-                    .take()
-                    .expect("Failed to take receiver! This should never happen"),
-                self.connections.clone()
-            ),
-            Self::process_connections(
-                listener,
-                self.send.clone(),
-                self.connections.clone()
-            )
-        }.map(|_| ())
+        let process_outgoing_messages = Self::process_outgoing_messages(
+            self.from_process
+                .take()
+                .expect("Failed to take receiver! This can only happen if server_loop is called more than once, which should never happen"),
+            self.connections.clone()
+        ).map(|_| Ok(()));
+
+        let process_incoming_messages = Self::process_incoming_messages(
+            self.internal_from_server
+                .take()
+                .expect("Failed to take receiver! This can only happen if server_loop is called more than once, which should never happen"),
+            self.to_process.clone(),
+            self.connections.clone()
+        ).map(|_| Ok(()));
+
+        let process_connections = Self::process_connections(
+            listener,
+            self.internal_to_process.clone(),
+            self.connections.clone()
+        );
+
+        tokio::select! {
+            r = process_outgoing_messages => r,
+            r = process_incoming_messages => r,
+            r = process_connections => r,
+            _ = self.token.cancelled() => Ok(()),
+        }
     }
 }
 
@@ -151,12 +212,13 @@ impl WebsocketServer {
             handle: None,
             recv: None,
             send: None,
-            flag: false,
+            token: CancellationToken::new(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn stop(&self) {
-        unimplemented!("stop not implemented")
+        self.token.cancel();
     }
 
     ///
@@ -192,13 +254,13 @@ impl WebsocketServer {
             .expect("Failed to send message! Server may have panicked");
     }
 
-    // TODO: Maybe don't return self? Maybe return a handle to the thread?
     ///
     /// Panics if the server is already running
     pub fn run(mut self) -> Self {
         let (from_server, to_process) = unbounded_channel::<Message>();
         let (from_process, to_server) = unbounded_channel::<Message>();
         let bound = self.bound.clone();
+        let token = self.token.clone();
 
         self.send = Some(from_process);
         self.recv = Some(to_process);
@@ -210,22 +272,17 @@ impl WebsocketServer {
 
         self.handle = Some(
             std::thread::spawn(move || {
-                let mut server = InternalServer {
+                let mut server = InternalServer::new(
                     bound,
-                    position: 0,
-                    send: from_server,
-                    recv: Some(to_server),
-                    connections: Arc::new(
-                        RwLock::new(
-                            ConnectionMap::new()
-                        )
-                    )
-                };
+                    token,
+                    from_server,
+                    to_server,
+                );
 
                 server.run_server_thread()
             })
         );
 
-        self
+        self // TODO: Maybe don't return self? Maybe return a handle to the thread?
     }
 }

@@ -1,10 +1,9 @@
 mod server;
-mod queue;
 
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
-use server::WebsocketServer;
+use server::{Message, WebsocketServer};
 
 const TICKS_PER_SECOND: u32 = 30;
 
@@ -12,9 +11,10 @@ const TICKS_PER_SECOND: u32 = 30;
 // spawn thread
 // run runtime
 fn main() {
-    println!("Starting server");
     let mut server = WebsocketServer::new("localhost", 3000)
         .run();
+
+    println!("Starting server");
 
     loop {
         let message = server.recv_next();
@@ -22,14 +22,12 @@ fn main() {
         if let Some(message) = message {
             println!("Received message in main: {:?}", message);
 
-            server.send(message);
+            if let Message::Message(_, _) = &message {
+                server.send(message);
+            }
         }
 
-
-
-
         thread::sleep(Duration::from_millis(1));
-        // println!("tick")
         // perform some work; if the time between now and the last tick is less than the duration per second, sleep for the difference
         // but don't actually sleep; we should sleep 1ms and check again
     }
