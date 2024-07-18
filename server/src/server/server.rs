@@ -10,7 +10,7 @@ use tokio::{
             UnboundedReceiver,
             UnboundedSender,
         }, 
-        RwLock,
+        // RwLock,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -24,8 +24,9 @@ use super::types::BoxedError;
 
 
 type ThreadHandle = std::thread::JoinHandle<Result<(), BoxedError>>;
-type ConnectionMap = std::collections::HashMap<uuid::Uuid, UnboundedSender<Message>>;
-type SharedConnectionMap = Arc<RwLock<ConnectionMap>>;
+// type ConnectionMap = std::collections::HashMap<uuid::Uuid, UnboundedSender<Message>>;
+type ConnectionMap = papaya::HashMap<uuid::Uuid, UnboundedSender<Message>>;
+type SharedConnectionMap = Arc<ConnectionMap>;
 
 
 struct InternalServer {
@@ -60,11 +61,7 @@ pub struct WebsocketServer {
 impl InternalServer {
     fn new(bound: String, token: CancellationToken, send: UnboundedSender<Message>, recv: UnboundedReceiver<Message>) -> Self {
         let (internal_send, internal_recv) = unbounded_channel::<Message>();
-        let connections = Arc::new(
-            RwLock::new(
-                ConnectionMap::new()
-            )
-        );
+        let connections = Arc::new(ConnectionMap::new());
 
         Self {
             bound,
@@ -98,8 +95,7 @@ impl InternalServer {
             // Remove the connection from the map if it's a disconnection message
             if let Message::Disconnection(uid) = msg {
                 mapping
-                    .write()
-                    .await
+                    .pin()
                     .remove(&uid);
             }
 
@@ -115,14 +111,11 @@ impl InternalServer {
     /// by looking up the connection id in the connection map
     async fn process_outgoing_messages(mut recv: UnboundedReceiver<Message>, mapping: SharedConnectionMap) {
         while let Some(msg) = recv.recv().await {
+            let map = mapping.pin();
             println!("Received outgoing message in process_outgoing_messages: {:?}", msg);
             
-            let rw = mapping
-                .read()
-                .await;
-
             let connection_id = &msg.connection_id();
-            let connection = rw.get(connection_id);
+            let connection = map.get(connection_id);
 
             if let Some(connection) = connection {
                 let result = connection
@@ -130,13 +123,7 @@ impl InternalServer {
                 
                 // If the connection is dead, remove it from the map
                 if let Err(_) = result {
-                    drop(rw); // Release the lock so we can write to the map
-
-                    let mut write = mapping
-                        .write()
-                        .await;
-    
-                    write.remove(connection_id);
+                    map.remove(connection_id);
                 }
             }
         }
@@ -156,10 +143,8 @@ impl InternalServer {
                 to_process.clone(),
             );
             
-            // Create a new connection and insert it into the connection map
             mapping
-                .write()
-                .await
+                .pin()
                 .insert(uid, send);
 
             tokio::spawn(async move { connection.run().await });
