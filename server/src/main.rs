@@ -1,9 +1,15 @@
 mod server;
 
 use std::thread;
-use std::time::{Duration, Instant};
-use tokio::runtime::Builder;
-use server::{Message, WebsocketServer};
+use std::time::{
+    Duration, 
+    Instant,
+};
+
+use server::{
+    Message, 
+    WebsocketServer,
+};
 
 const TICKS_PER_SECOND: u32 = 30;
 
@@ -11,19 +17,36 @@ const TICKS_PER_SECOND: u32 = 30;
 // spawn thread
 // run runtime
 fn main() {
-    let mut server = WebsocketServer::new("localhost", 3000)
+    let server = WebsocketServer::new("localhost", 3000)
         .run();
+
+    let mut connections: Vec<uuid::Uuid> = vec![];
 
     println!("Starting server");
 
     loop {
-        let message = server.recv_next();
+        let messages = server.recv_next();
 
-        if let Some(message) = message {
+        for message in messages {
             println!("Received message in main: {:?}", message);
 
-            if let Message::Message(_, _) = &message {
-                server.send(message);
+            match &message {
+                Message::Connection(uid) => {
+                    connections.push(*uid);
+                },
+                Message::Disconnection(uid) => {
+                    connections.retain(|&x| x != *uid);
+                },
+                Message::Message(_, text) => {
+                    for connection in &connections {
+                        let nmessage = Message::Message(
+                            *connection,
+                            text.clone()
+                        );
+
+                        server.send(nmessage)
+                    }
+                }
             }
         }
 

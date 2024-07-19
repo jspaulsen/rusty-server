@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
+use crossbeam_channel::{
+    unbounded,
+    Receiver,
+    Sender, TryIter,
+};
 use futures_util::FutureExt;
 use tokio::{
     net::TcpListener,
     runtime::Builder,
-    sync::{
-        mpsc::{
-            unbounded_channel,
-            UnboundedReceiver,
-            UnboundedSender,
-        }, 
-        // RwLock,
+    sync::mpsc::{
+        unbounded_channel,
+        UnboundedReceiver,
+        UnboundedSender,
     },
+
 };
 use tokio_util::sync::CancellationToken;
 
@@ -24,19 +27,33 @@ use super::types::BoxedError;
 
 
 type ThreadHandle = std::thread::JoinHandle<Result<(), BoxedError>>;
-// type ConnectionMap = std::collections::HashMap<uuid::Uuid, UnboundedSender<Message>>;
 type ConnectionMap = papaya::HashMap<uuid::Uuid, UnboundedSender<Message>>;
 type SharedConnectionMap = Arc<ConnectionMap>;
+
+type ToProcess = Sender<Message>;
+type FromServer = Receiver<Message>;
+type FromProcess = UnboundedReceiver<Message>;
+
+type InternalToProcess = UnboundedSender<Message>;
+type InternalFromServer = UnboundedReceiver<Message>;
 
 
 struct InternalServer {
     bound: String,
-    to_process: UnboundedSender<Message>, // from_server -> to_process
-    from_process: Option<UnboundedReceiver<Message>>, // from_process -> to_server
 
-    internal_to_process: UnboundedSender<Message>,
-    internal_from_server: Option<UnboundedReceiver<Message>>,
+    /// Messages from the server to be sent to the process
+    to_process: ToProcess,
 
+    /// Messages from process to be sent to the server
+    from_process: Option<FromProcess>,
+
+    /// Messages from the server to be sent to the process by intermediary step
+    internal_to_process: InternalToProcess,
+
+    /// Messages from the process to be sent to the server by intermediary step
+    internal_from_server: Option<InternalFromServer>,
+
+    /// Token to cancel the server
     token: CancellationToken,
 
     // TODO: maybe we want to route messages to each connection instead of just having a send loop which
@@ -52,14 +69,13 @@ pub struct WebsocketServer {
     token: CancellationToken,
     handle: Option<ThreadHandle>,
 
-    recv: Option<UnboundedReceiver<Message>>,
+    recv: Option<FromServer>,
     send: Option<UnboundedSender<Message>>,
 }
 
 
-
 impl InternalServer {
-    fn new(bound: String, token: CancellationToken, send: UnboundedSender<Message>, recv: UnboundedReceiver<Message>) -> Self {
+    fn new(bound: String, token: CancellationToken, send: ToProcess, recv: UnboundedReceiver<Message>) -> Self {
         let (internal_send, internal_recv) = unbounded_channel::<Message>();
         let connections = Arc::new(ConnectionMap::new());
 
@@ -88,7 +104,7 @@ impl InternalServer {
     }
 
     /// Processes messages coming from the websocket connections and sends them to the process
-    async fn process_incoming_messages(mut recv: UnboundedReceiver<Message>, send: UnboundedSender<Message>, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
+    async fn process_incoming_messages(mut recv: UnboundedReceiver<Message>, to_process: ToProcess, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
         while let Some(msg) = recv.recv().await {
             println!("Received incoming message in process_incoming_messages: {:?}", msg);
             
@@ -99,8 +115,8 @@ impl InternalServer {
                     .remove(&uid);
             }
 
-            send
-                .send(msg)
+            to_process
+                .try_send(msg)
                 .expect("Failed to send message - process_incoming_messages. This will only happen if the server has panicked");
         }
 
@@ -129,7 +145,7 @@ impl InternalServer {
         }
     }
 
-    async fn process_connections(listener: TcpListener, to_process: UnboundedSender<Message>, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
+    async fn process_connections(listener: TcpListener, to_process: InternalToProcess, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
         loop {
             let (stream, _) = listener.accept().await?;
             let ws_stream = tokio_tungstenite::accept_async(stream).await?;
@@ -206,26 +222,15 @@ impl WebsocketServer {
         self.token.cancel();
     }
 
-    ///
     /// Panics if the server is not running
-    pub fn recv_next(&mut self) -> Option<Message> {
+    pub fn recv_next(&self) -> TryIter<Message> {
         let recv = self
             .recv
-            .as_mut()
+            .as_ref()
             .expect("Server is not running!");
 
-        let next = recv
-            .try_recv();
-
-        match next {
-            Ok(msg) => Some(msg),
-            Err(err) => {
-                match err { // TODO: We should clean this up, but for now this is fine
-                    tokio::sync::mpsc::error::TryRecvError::Empty => None,
-                    tokio::sync::mpsc::error::TryRecvError::Disconnected => panic!("Websocket server thread has panicked"),
-                }
-            }
-        }
+        recv
+            .try_iter()
     }
 
     pub fn send(&self, message: Message) {
@@ -242,7 +247,7 @@ impl WebsocketServer {
     ///
     /// Panics if the server is already running
     pub fn run(mut self) -> Self {
-        let (from_server, to_process) = unbounded_channel::<Message>();
+        let (from_server, to_process) = unbounded::<Message>();
         let (from_process, to_server) = unbounded_channel::<Message>();
         let bound = self.bound.clone();
         let token = self.token.clone();
