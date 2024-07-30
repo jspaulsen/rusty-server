@@ -27,8 +27,11 @@ function onReceive(message) {
     element.appendChild(p);
 }
 
-ws.onmessage = onReceive;
+// add event listener to chatbox, if enter key is pressed, send message
+document.getElementById('send').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+        onSend();
+    }
+});
 
-{/* <p style="text-align: left; margin: 5px;">Jane: Hello</p>
-<p style="text-align: left; margin: 5px;">Jane: Hello</p>
-<p style="text-align: left; margin: 5px;">Jane: Hello</p> */}
+ws.onmessage = onReceive;
