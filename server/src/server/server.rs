@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    net::SocketAddr, 
+    sync::Arc,
+};
 
 use crossbeam_channel::{
     unbounded,
@@ -7,14 +10,13 @@ use crossbeam_channel::{
 };
 use futures_util::FutureExt;
 use tokio::{
-    net::TcpListener,
-    runtime::Builder,
+    net::TcpListener, 
+    runtime::Builder, 
     sync::mpsc::{
         unbounded_channel,
         UnboundedReceiver,
         UnboundedSender,
     },
-
 };
 use tokio_util::sync::CancellationToken;
 
@@ -27,8 +29,9 @@ use super::types::BoxedError;
 
 
 type ThreadHandle = std::thread::JoinHandle<Result<(), BoxedError>>;
-type ConnectionMap = papaya::HashMap<uuid::Uuid, UnboundedSender<Message>>;
-type SharedConnectionMap = Arc<ConnectionMap>;
+type ConnectionHandle = tokio::task::JoinHandle<Result<(), BoxedError>>;
+pub type ConnectionMap = papaya::HashMap<uuid::Uuid, MappedConnection>;
+pub type SharedConnectionMap = Arc<ConnectionMap>;
 
 type ToProcess = Sender<Message>;
 type FromServer = Receiver<Message>;
@@ -37,6 +40,13 @@ type FromProcess = UnboundedReceiver<Message>;
 type InternalToProcess = UnboundedSender<Message>;
 type InternalFromServer = UnboundedReceiver<Message>;
 
+
+pub struct MappedConnection {
+    to_connection: UnboundedSender<Message>,
+
+    pub handle: Option<ConnectionHandle>,
+    pub address: SocketAddr,
+}
 
 struct InternalServer {
     bound: String,
@@ -71,13 +81,14 @@ pub struct WebsocketServer {
 
     recv: Option<FromServer>,
     send: Option<UnboundedSender<Message>>,
+
+    connections: SharedConnectionMap,
 }
 
 
 impl InternalServer {
-    fn new(bound: String, token: CancellationToken, send: ToProcess, recv: UnboundedReceiver<Message>) -> Self {
+    fn new(bound: String, connections: SharedConnectionMap, token: CancellationToken, send: ToProcess, recv: UnboundedReceiver<Message>) -> Self {
         let (internal_send, internal_recv) = unbounded_channel::<Message>();
-        let connections = Arc::new(ConnectionMap::new());
 
         Self {
             bound,
@@ -135,6 +146,7 @@ impl InternalServer {
 
             if let Some(connection) = connection {
                 let result = connection
+                    .to_connection
                     .send(msg);
                 
                 // If the connection is dead, remove it from the map
@@ -148,7 +160,14 @@ impl InternalServer {
     async fn process_connections(listener: TcpListener, to_process: InternalToProcess, mapping: SharedConnectionMap) -> Result<(), BoxedError> {
         loop {
             let (stream, _) = listener.accept().await?;
-            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            let maybe_address = stream.peer_addr();
+
+            // If we can't get the address, just continue
+            if maybe_address.is_err() {
+                continue;
+            }
+
+            let ws_stream  = tokio_tungstenite::accept_async(stream).await?;
             let uid = uuid::Uuid::new_v4();
 
             let (send, recv) = unbounded_channel::<Message>();
@@ -158,16 +177,28 @@ impl InternalServer {
                 recv, 
                 to_process.clone(),
             );
-            
+
+            let mut mapped_connection = MappedConnection {
+                to_connection: send,
+                handle: None,
+                address: maybe_address
+                    .unwrap(),
+            };
+
+            mapped_connection.handle = Some(
+                tokio::spawn(
+                    async move { 
+                        connection.run().await 
+                    }
+                )
+            );
+
             mapping
                 .pin()
-                .insert(uid, send);
-
-            tokio::spawn(async move { connection.run().await });
+                .insert(uid, mapped_connection);
         }
     }
 
-    // TODO:
     async fn server_loop(&mut self) -> Result<(), BoxedError> {
         let listener = TcpListener::bind(&self.bound)
             .await
@@ -214,12 +245,20 @@ impl WebsocketServer {
             recv: None,
             send: None,
             token: CancellationToken::new(),
+            connections: Arc::new(ConnectionMap::new()),
         }
     }
 
+    // TODO: Finish this
     #[allow(dead_code)]
     pub fn stop(&self) {
         self.token.cancel();
+    }
+
+    pub fn connections(&self) -> SharedConnectionMap {
+        self
+            .connections
+            .clone()
     }
 
     /// Panics if the server is not running
@@ -251,6 +290,7 @@ impl WebsocketServer {
         let (from_process, to_server) = unbounded_channel::<Message>();
         let bound = self.bound.clone();
         let token = self.token.clone();
+        let connections = self.connections.clone();
 
         self.send = Some(from_process);
         self.recv = Some(to_process);
@@ -264,6 +304,7 @@ impl WebsocketServer {
             std::thread::spawn(move || {
                 let mut server = InternalServer::new(
                     bound,
+                    connections,
                     token,
                     from_server,
                     to_server,

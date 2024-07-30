@@ -20,31 +20,38 @@ fn main() {
     let server = WebsocketServer::new("localhost", 3000)
         .run();
 
-    let mut connections: Vec<uuid::Uuid> = vec![];
-
-    println!("Starting server");
-
     loop {
         let messages = server.recv_next();
+        let connections = server.connections();
 
         for message in messages {
-            println!("Received message in main: {:?}", message);
+            let id = message.connection_id();
+            let pin = connections.pin();
+
+            let maybe_connection = pin
+                .get(&id);
+
+            if !maybe_connection.is_some() {
+                continue;
+            }
+
+            let connection = maybe_connection.unwrap();
 
             match &message {
                 Message::Connection(uid) => {
-                    connections.push(*uid);
+                    println!("Connection: {:?} => {:?}", uid, connection.address);
                 },
                 Message::Disconnection(uid) => {
-                    connections.retain(|&x| x != *uid);
+                    println!("Disconnect: {:?} => {:?}", uid, connection.address);
                 },
                 Message::Message(_, text) => {
-                    for connection in &connections {
-                        let nmessage = Message::Message(
-                            *connection,
-                            text.clone()
-                        );
+                    let messages = pin
+                        .keys()
+                        .map(|&x| Message::Message (x, text.clone()))
+                        .collect::<Vec<Message>>();
 
-                        server.send(nmessage)
+                    for message in messages {
+                        server.send(message);
                     }
                 }
             }
