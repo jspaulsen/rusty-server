@@ -5,6 +5,4 @@ mod types;
 
 
 pub use messages::Message;
-pub use server::{
-    WebsocketServer,
-};
+pub use server::WebsocketServer;

@@ -1,9 +1,15 @@
 mod server;
 
 use std::thread;
-use std::time::{Duration, Instant};
-use tokio::runtime::Builder;
-use server::{Message, WebsocketServer};
+use std::time::{
+    Duration, 
+    Instant,
+};
+
+use server::{
+    Message, 
+    WebsocketServer,
+};
 
 const TICKS_PER_SECOND: u32 = 30;
 
@@ -11,19 +17,43 @@ const TICKS_PER_SECOND: u32 = 30;
 // spawn thread
 // run runtime
 fn main() {
-    let mut server = WebsocketServer::new("localhost", 3000)
+    let server = WebsocketServer::new("localhost", 3000)
         .run();
 
-    println!("Starting server");
-
     loop {
-        let message = server.recv_next();
+        let messages = server.recv_next();
+        let connections = server.connections();
 
-        if let Some(message) = message {
-            println!("Received message in main: {:?}", message);
+        for message in messages {
+            let id = message.connection_id();
+            let pin = connections.pin();
 
-            if let Message::Message(_, _) = &message {
-                server.send(message);
+            let maybe_connection = pin
+                .get(&id);
+
+            if !maybe_connection.is_some() {
+                continue;
+            }
+
+            let connection = maybe_connection.unwrap();
+
+            match &message {
+                Message::Connection(uid) => {
+                    println!("Connection: {:?} => {:?}", uid, connection.address);
+                },
+                Message::Disconnection(uid) => {
+                    println!("Disconnect: {:?} => {:?}", uid, connection.address);
+                },
+                Message::Message(_, text) => {
+                    let messages = pin
+                        .keys()
+                        .map(|&x| Message::Message (x, text.clone()))
+                        .collect::<Vec<Message>>();
+
+                    for message in messages {
+                        server.send(message);
+                    }
+                }
             }
         }
 
